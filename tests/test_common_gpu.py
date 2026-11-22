@@ -47,6 +47,7 @@ from peft import (
     LoraConfig,
     OFTConfig,
     PeftModel,
+    PveraConfig,
     RandLoraConfig,
     RoadConfig,
     TaskType,
@@ -1716,6 +1717,147 @@ class PeftGPUCommonTests(unittest.TestCase):
         assert torch.allclose(probs_road, probs_merged, atol=atol, rtol=rtol)
         assert torch.allclose(probs_road, probs_unmerged, atol=atol, rtol=rtol)
         assert torch.allclose(probs_road, probs_unloaded, atol=atol, rtol=rtol)
+
+    @require_non_cpu
+    @pytest.mark.single_gpu_tests
+    @require_bitsandbytes
+    def test_8bit_randlora_merging(self):
+        # Check results for merging, unmerging, unloading
+        torch.manual_seed(0)
+        model = AutoModelForCausalLM.from_pretrained(
+            "peft-internal-testing/opt-125m",
+            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+            dtype=torch.float32,
+        ).eval()
+        random_input = torch.LongTensor([[1, 0, 1, 0, 1, 0]]).to(model.device)
+        # compare outputs in probability space, because logits can have outliers
+        # and token ids are not precise enough
+        out_base = F.softmax(model(random_input).logits, dim=-1)
+
+        # fc1 is not square, so multiplying the bases in the wrong order in get_delta_weight raises. With
+        # init_weights=False, the default randlora_alpha (640) gives a delta much larger than the base weights.
+        config = RandLoraConfig(target_modules=["q_proj", "v_proj", "fc1"], randlora_alpha=32, init_weights=False)
+        model = get_peft_model(model, config).eval()
+
+        with torch.inference_mode():
+            out_randlora = F.softmax(model(random_input).logits, dim=-1)
+
+            model.merge_adapter()
+            out_merged = F.softmax(model(random_input).logits, dim=-1)
+
+            model.unmerge_adapter()
+            out_unmerged = F.softmax(model(random_input).logits, dim=-1)
+
+            model = model.merge_and_unload()
+            out_unloaded = F.softmax(model(random_input).logits, dim=-1)
+
+        atol = 1e-3
+        rtol = 1
+        assert not torch.allclose(out_base, out_randlora, atol=atol, rtol=rtol)
+        assert torch.allclose(out_randlora, out_merged, atol=atol, rtol=rtol)
+        assert torch.allclose(out_randlora, out_unmerged, atol=atol, rtol=rtol)
+        assert torch.allclose(out_randlora, out_unloaded, atol=atol, rtol=rtol)
+
+    @require_non_cpu
+    @pytest.mark.single_gpu_tests
+    @require_bitsandbytes
+    def test_4bit_randlora_merging(self):
+        # Check results for merging, unmerging, unloading
+        torch.manual_seed(0)
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=False,
+            bnb_4bit_compute_dtype=torch.float32,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            "peft-internal-testing/opt-125m",
+            quantization_config=bnb_config,
+            dtype=torch.float32,
+        ).eval()
+        random_input = torch.LongTensor([[1, 0, 1, 0, 1, 0]]).to(model.device)
+        # compare outputs in probability space, because logits can have outliers
+        # and token ids are not precise enough
+        out_base = F.softmax(model(random_input).logits, dim=-1)
+
+        # fc1 is not square, so multiplying the bases in the wrong order in get_delta_weight raises. With
+        # init_weights=False, the default randlora_alpha (640) gives a delta much larger than the base weights.
+        config = RandLoraConfig(target_modules=["q_proj", "v_proj", "fc1"], randlora_alpha=32, init_weights=False)
+        model = get_peft_model(model, config).eval()
+        layer = model.base_model.model.model.decoder.layers[0].fc1
+        weight_dtype = layer.get_base_layer().weight.dtype
+
+        with torch.inference_mode():
+            out_randlora = F.softmax(model(random_input).logits, dim=-1)
+
+            model.merge_adapter()
+            # the merged weight has to be quantized again
+            assert layer.get_base_layer().weight.dtype == weight_dtype
+            out_merged = F.softmax(model(random_input).logits, dim=-1)
+
+            model.unmerge_adapter()
+            assert layer.get_base_layer().weight.dtype == weight_dtype
+            out_unmerged = F.softmax(model(random_input).logits, dim=-1)
+
+            model = model.merge_and_unload()
+            out_unloaded = F.softmax(model(random_input).logits, dim=-1)
+
+        # tolerances are pretty high because some deviations are expected with quantization
+        atol = 0.01
+        rtol = 10
+        assert not torch.allclose(out_base, out_randlora, atol=atol, rtol=rtol)
+        assert torch.allclose(out_randlora, out_merged, atol=atol, rtol=rtol)
+        assert torch.allclose(out_randlora, out_unmerged, atol=atol, rtol=rtol)
+        assert torch.allclose(out_randlora, out_unloaded, atol=atol, rtol=rtol)
+
+    @require_non_cpu
+    @pytest.mark.single_gpu_tests
+    @require_bitsandbytes
+    def test_4bit_pvera_merging(self):
+        # Check results for merging, unmerging, unloading
+        torch.manual_seed(0)
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=False,
+            bnb_4bit_compute_dtype=torch.float32,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            "peft-internal-testing/opt-125m",
+            quantization_config=bnb_config,
+            dtype=torch.float32,
+        ).eval()
+        random_input = torch.LongTensor([[1, 0, 1, 0, 1, 0]]).to(model.device)
+        # compare outputs in probability space, because logits can have outliers
+        # and token ids are not precise enough
+        out_base = F.softmax(model(random_input).logits, dim=-1)
+
+        config = PveraConfig(init_weights=False)
+        # eval mode is needed, PVeRA samples in the forward pass while training
+        model = get_peft_model(model, config).eval()
+        layer = model.base_model.model.model.decoder.layers[0].self_attn.q_proj
+        weight_dtype = layer.get_base_layer().weight.dtype
+
+        with torch.inference_mode():
+            out_pvera = F.softmax(model(random_input).logits, dim=-1)
+
+            model.merge_adapter()
+            # the merged weight has to be quantized again
+            assert layer.get_base_layer().weight.dtype == weight_dtype
+            out_merged = F.softmax(model(random_input).logits, dim=-1)
+
+            model.unmerge_adapter()
+            assert layer.get_base_layer().weight.dtype == weight_dtype
+            out_unmerged = F.softmax(model(random_input).logits, dim=-1)
+
+            model = model.merge_and_unload()
+            out_unloaded = F.softmax(model(random_input).logits, dim=-1)
+
+        # tolerances are pretty high because some deviations are expected with quantization
+        atol = 0.01
+        rtol = 10
+        assert not torch.allclose(out_base, out_pvera, atol=atol, rtol=rtol)
+        assert torch.allclose(out_pvera, out_merged, atol=atol, rtol=rtol)
+        assert torch.allclose(out_pvera, out_unmerged, atol=atol, rtol=rtol)
+        assert torch.allclose(out_pvera, out_unloaded, atol=atol, rtol=rtol)
 
     def test_apply_GS_hra_inference(self):
         # check for different result with and without apply_GS

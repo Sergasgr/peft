@@ -297,9 +297,11 @@ if is_bnb_4bit_available():
                         f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
                     )
 
-                self.get_base_layer().weight = bnb.nn.Params4bit(w_data.to("cpu"), requires_grad=False, **kwargs).to(
-                    weight.device
-                )
+                if "bnb_quantized" in kwargs:
+                    kwargs["bnb_quantized"] = False
+                kwargs["requires_grad"] = False
+                kwargs.pop("data", None)
+                self.get_base_layer().weight = bnb.nn.Params4bit(w_data.to("cpu"), **kwargs).to(weight.device)
                 self.merged_adapters.append(active_adapter)
 
         def unmerge(self) -> None:
@@ -320,9 +322,13 @@ if is_bnb_4bit_available():
                 kwargs = weight.__dict__
                 w_data = bnb.functional.dequantize_4bit(weight.data, weight.quant_state) - pvera_data
 
-                self.get_base_layer().weight = bnb.nn.Params4bit(w_data.to("cpu"), requires_grad=False, **kwargs).to(
-                    weight.device
-                )
+                if "bnb_quantized" in kwargs:
+                    kwargs["bnb_quantized"] = False
+                kwargs["requires_grad"] = False
+                kwargs.pop("data", None)
+                # torch.compile can introduce attributes preceded by '_', remove them
+                kwargs = {k: v for k, v in kwargs.items() if not k.startswith("_")}
+                self.get_base_layer().weight = bnb.nn.Params4bit(w_data.to("cpu"), **kwargs).to(weight.device)
 
         def get_delta_weight(self, adapter) -> torch.Tensor:
             pvera_A = self.pvera_A[adapter]
